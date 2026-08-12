@@ -2,6 +2,8 @@ import type { OcxProviderConfig } from "../../types";
 import type { CursorClientMessage, CursorRunRequest, CursorServerMessage } from "./types";
 import type { TranslatorBudget } from "../../lib/translator-budget";
 
+export type CursorTransportMode = "http2" | "http1-sse";
+
 export interface CursorTransport {
   run(request: CursorRunRequest, signal?: AbortSignal): AsyncIterable<CursorServerMessage>;
   writeClient(message: CursorClientMessage): void | Promise<void>;

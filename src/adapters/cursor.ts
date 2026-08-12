@@ -14,6 +14,7 @@ import {
   rekeyCursorContextUsage,
   resolveCursorToken,
 } from "./cursor/live-transport";
+import { createHttp1SseCursorTransport } from "./cursor/http1-sse-transport";
 import { rememberCursorThreadConversation } from "./cursor/thread-continuity";
 import { runCursorTurnWithRetry } from "./cursor/transport-retry";
 import {
@@ -40,6 +41,12 @@ export interface CursorAdapterDeps {
   kv?: CursorKvStore;
   /** Test seam: observe/replace context-usage rekeying on conversation-id rotation. */
   rekeyContextUsage?: (fromConversationId: string, toConversationId: string) => void;
+}
+
+export function selectCursorTransportFactory(provider: OcxProviderConfig): CursorTransportFactory {
+  return provider.cursorTransport === "http1-sse"
+    ? createHttp1SseCursorTransport
+    : createLiveCursorTransport;
 }
 
 function safeCursorTransportError(err: unknown): string {
@@ -78,7 +85,7 @@ export function createCursorAdapter(provider: OcxProviderConfig, deps: CursorAda
         return;
       }
       try {
-        const makeTransport = deps.createTransport ?? createLiveCursorTransport;
+        const makeTransport = deps.createTransport ?? selectCursorTransportFactory(provider);
         const kv = deps.kv ?? createCursorKvStore({}, incoming.translatorBudget);
         const rekeyContextUsage = deps.rekeyContextUsage ?? rekeyCursorContextUsage;
         // Namespace thread→conversation derivation by the authenticated Cursor credential so
