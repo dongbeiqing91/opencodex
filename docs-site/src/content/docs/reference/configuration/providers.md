@@ -124,6 +124,7 @@ differing backup and rewrites known legacy namespaced selected ids to bare ids.
 | `googleMode?` | `"ai-studio" \| "vertex" \| "cloud-code-assist"` | Google transport/auth mode. Default `ai-studio`. |
 | `project?` | `string` | Vertex or Antigravity Cloud Code Assist project id. |
 | `location?` | `string` | Vertex location; environment fallback is `GOOGLE_CLOUD_LOCATION`. |
+| `cursorTransport?` | `"http2" \| "http1-sse"` | Cursor only. Defaults to HTTP/2; `http1-sse` uses the HTTP/1.1 `RunSSE`/`BidiAppend` split transport without polling or automatic fallback. |
 | `mcpServers?` | `Record<string, CursorMcpServerConfig>` | Cursor only: stdio or Streamable HTTP MCP servers. |
 | `desktopExecutor?` | `DesktopExecutorConfig` | Cursor only: external computer-use and record-screen commands. |
 | `unsafeAllowNativeLocalExec?` | `boolean` | Cursor legacy boolean, equivalent to `nativeLocalExec: "on"` only when the newer field is unset. |
@@ -302,14 +303,19 @@ Cursor server-driven local tools are disabled by default. Codex continues using 
       "baseUrl": "https://api2.cursor.sh",
       "authMode": "oauth",
       "defaultModel": "auto",
+      "cursorTransport": "http1-sse",
       "nativeLocalExec": "off"
     }
   }
 }
 ```
 
-Set the field on `providers.cursor`, not at the top level. In the dashboard use **Providers → Cursor
-→ Edit JSON**, save, then restart. Legacy `unsafeAllowNativeLocalExec: true` equals
+Set the field on `providers.cursor`, not at the top level. `cursorTransport` defaults to `"http2"`;
+set it to `"http1-sse"` when the network cannot carry Cursor's HTTP/2 stream. This mode uses
+`AgentService/RunSSE` for binary Connect response frames and ordered
+`BidiService/BidiAppend` requests over HTTP/1.1. It does not enable polling or automatic transport
+fallback. In the dashboard use **Providers → Cursor → Edit JSON**, save, then restart. Legacy
+`unsafeAllowNativeLocalExec: true` equals
 `nativeLocalExec: "on"` only when `nativeLocalExec` is unset. MCP, screen recording, and computer use
 are controlled separately by `mcpServers` and `desktopExecutor`.
 

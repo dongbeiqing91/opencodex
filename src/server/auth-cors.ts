@@ -570,6 +570,12 @@ export function providerManagementConfigError(name: unknown, provider: unknown):
     return `provider ${name} must not include codexAccountMode`;
   }
   const typed = provider as unknown as OcxProviderConfig;
+  if (raw.cursorTransport !== undefined) {
+    if (typed.adapter !== "cursor") return `provider ${name} cursorTransport is only supported on the Cursor adapter`;
+    if (raw.cursorTransport !== "http2" && raw.cursorTransport !== "http1-sse") {
+      return `provider ${name} cursorTransport must be http2 or http1-sse`;
+    }
+  }
   const baseUrlError = providerBaseUrlConfigError(typed.baseUrl);
   if (baseUrlError) return `provider ${name} ${baseUrlError}`;
   if (effectiveGoogleMode(name, typed) === "vertex" && typed.location !== undefined) {
@@ -719,6 +725,7 @@ export function safeConfigDTO(config: OcxConfig): unknown {
       "preserveReasoningContentModels",
       "requiresReasoningPlaceholderModels",
       "escapeBuiltinToolNames",
+      "cursorTransport",
     ] as const) {
       copyIfDefined(dto, provider, key);
     }

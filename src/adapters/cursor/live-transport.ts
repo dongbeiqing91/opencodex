@@ -1,4 +1,7 @@
 import http2 from "node:http2";
+import http, { type ClientRequest, type IncomingMessage } from "node:http";
+import https from "node:https";
+import { EventEmitter } from "node:events";
 import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import { namespacedToolName, type OcxProviderConfig, type OcxUsage } from "../../types";
 import { CONNECT_FLAG_END_STREAM, ConnectFrameError, consumeConnectFrames, encodeConnectFrame } from "./framing";
@@ -17,7 +20,6 @@ import {
   createCursorContextUsageTracker,
   createCursorProtobufEventState,
   finalizeTurnEvents,
-  mapCursorProtobufServerMessage,
   mapSyntheticMcpExecToToolEvents,
   reportableContextTokens,
   resolvedTurnUsage,
@@ -26,6 +28,7 @@ import {
 import {
   AgentClientMessageSchema,
   AgentServerMessageSchema,
+  BidiRequestIdSchema,
   AskQuestionInteractionResponseSchema,
   AskQuestionRejectedSchema,
   AskQuestionResultSchema,
@@ -52,8 +55,6 @@ import { classifyCursorError, isCursorBenignCancelError, safeCursorErrorMessage 
 import { mcpArgsFromToolCall } from "./protobuf-events";
 import { OCX_RESPONSES_TOOL_PROVIDER } from "./tool-definitions";
 import {
-  handleCursorNativeExec,
-  handleCursorNativeKv,
   releaseCursorBlobRequestScope,
   type CursorBlobRequestScopeToken,
   type CursorNativeExecContext,
@@ -61,8 +62,10 @@ import {
 import { effectiveCursorNativeExecAllow } from "./exec-policy";
 import { resolveMcpServers } from "./mcp-config";
 import { CursorMcpManager } from "./mcp-manager";
+import { createBidiAppendClient, type BidiAppendClient } from "./bidi-append";
 import { buildMcpToolDefinitions, mcpDepsFromManager } from "./native-exec-mcp";
 import { desktopDepsFromConfig } from "./native-exec-desktop";
+import { handleCursorServerMessage } from "./cursor-turn-runtime";
 import {
   buildCursorToolDefinitions,
   cursorRequestAdvertisesApplyPatch,
@@ -406,6 +409,11 @@ export function clientToolFinalizeGraceMsForRequest(request: CursorRunRequest, b
 class LiveCursorTransport implements CursorTransport {
   private session?: http2.ClientHttp2Session;
   private stream?: http2.ClientHttp2Stream;
+  private http1Request?: ClientRequest;
+  private http1Response?: IncomingMessage;
+  private http1Append?: BidiAppendClient;
+  private http1Ready = false;
+  private http1PendingWrites: Uint8Array[] = [];
   private heartbeat?: ReturnType<typeof setInterval>;
   private firstFrameTimer?: ReturnType<typeof setTimeout>;
   private committed = false;
@@ -549,11 +557,6 @@ class LiveCursorTransport implements CursorTransport {
         .filter(isCursorSyntheticStructuredEditTool)
         .map(cursorToolWireName),
     );
-    const freeformToolNames = new Set(
-      (cursorVisibleTools ?? [])
-        .filter(tool => tool.freeform)
-        .map(tool => namespacedToolName(tool.namespace, tool.name)),
-    );
     this.execContext = {
       ...this.execContext,
       clientToolDefs,
@@ -583,7 +586,6 @@ class LiveCursorTransport implements CursorTransport {
     try {
       state = createCursorProtobufEventState({
         clientToolNames: clientToolDefs.map(tool => tool.toolName || tool.name),
-        freeformToolNames,
         parallelToolCalls: request.parallelToolCalls,
         toolSchemas,
         cursorToolNameMap,
@@ -651,17 +653,18 @@ class LiveCursorTransport implements CursorTransport {
   }
 
   private updateTransportFlowControl(): void {
+    const responseStream = this.stream ?? this.http1Response;
     if (
       this.transportBufferedBytes >= CURSOR_TRANSPORT_MAX_BUFFERED_BYTES
       || this.pendingTransportFrames >= CURSOR_MAX_PENDING_FRAMES
     ) {
-      this.stream?.pause();
+      responseStream?.pause();
       return;
     }
     if (
       this.transportBufferedBytes <= CURSOR_TRANSPORT_RESUME_BYTES
       && this.pendingTransportFrames <= CURSOR_PENDING_FRAMES_RESUME
-    ) this.stream?.resume();
+    ) responseStream?.resume();
   }
 
   requestCommitted(): boolean {
@@ -685,6 +688,11 @@ class LiveCursorTransport implements CursorTransport {
     this.clearFirstFrameTimer();
     this.stream?.close();
     this.session?.close();
+    this.http1Request?.destroy();
+    this.http1Response?.destroy();
+    this.http1Ready = false;
+    this.http1PendingWrites = [];
+    await this.http1Append?.close();
     this.releaseBlobRequestScope();
     this.releaseMcpObservation?.();
     this.releaseMcpObservation = undefined;
@@ -703,6 +711,11 @@ class LiveCursorTransport implements CursorTransport {
       this.stream?.destroy();
     }
     this.session?.close();
+    this.http1Request?.destroy();
+    this.http1Response?.destroy();
+    this.http1Ready = false;
+    this.http1PendingWrites = [];
+    void this.http1Append?.close();
     this.releaseBlobRequestScope();
     this.releaseMcpObservation?.();
     this.releaseMcpObservation = undefined;
@@ -759,6 +772,124 @@ class LiveCursorTransport implements CursorTransport {
     }, this.activeClientToolFinalizeGraceMs);
   }
 
+  private openHttp1SseWire(_signal: AbortSignal | undefined): void {
+    const requestId = crypto.randomUUID();
+    const eventStream = new EventEmitter() as EventEmitter & {
+      destroyed: boolean;
+      write: (data: Uint8Array) => boolean;
+      close: () => void;
+      destroy: () => void;
+      pause: () => void;
+      resume: () => void;
+    };
+    eventStream.destroyed = false;
+    eventStream.pause = () => this.http1Response?.pause();
+    eventStream.resume = () => this.http1Response?.resume();
+    eventStream.write = (data: Uint8Array) => {
+      try {
+        const decoded = consumeConnectFrames(new Uint8Array(data));
+        if (decoded.frames.length !== 1 || decoded.consumedBytes !== data.byteLength) {
+          throw new ConnectFrameError("frame_incomplete", "Cursor HTTP/1.1 client message was not one complete Connect frame");
+        }
+        const payload = decoded.frames[0]!.payload.slice();
+        if (!this.http1Ready) {
+          this.http1PendingWrites.push(payload);
+        } else {
+          void this.http1Append?.append(payload).catch(error => eventStream.emit("error", error));
+        }
+        return true;
+      } catch (error) {
+        queueMicrotask(() => eventStream.emit("error", error instanceof Error ? error : new Error(String(error))));
+        return false;
+      }
+    };
+    const close = () => {
+      if (eventStream.destroyed) return;
+      eventStream.destroyed = true;
+      this.http1Request?.destroy();
+      this.http1Response?.destroy();
+      queueMicrotask(() => eventStream.emit("end"));
+    };
+    eventStream.close = close;
+    eventStream.destroy = close;
+    this.stream = eventStream as unknown as http2.ClientHttp2Stream;
+    this.http1Append = createBidiAppendClient({
+      baseUrl: this.input.provider.baseUrl || "https://api2.cursor.sh",
+      token: this.token,
+      requestId,
+      clientVersion: CURSOR_CLIENT_VERSION,
+    });
+
+    const baseUrl = new URL(this.input.provider.baseUrl || "https://api2.cursor.sh");
+    const requestOptions = {
+      protocol: baseUrl.protocol,
+      hostname: baseUrl.hostname,
+      port: baseUrl.port || undefined,
+      method: "POST",
+      path: "/agent.v1.AgentService/RunSSE",
+      headers: {
+        authorization: `Bearer ${this.token}`,
+        "content-type": "application/connect+proto",
+        "connect-protocol-version": "1",
+        te: "trailers",
+        "x-ghost-mode": "true",
+        "x-cursor-client-version": CURSOR_CLIENT_VERSION,
+        "x-cursor-client-type": "cli",
+        "x-request-id": requestId,
+        "x-session-id": this.sessionId,
+      },
+    };
+    const requestFn = baseUrl.protocol === "https:" ? https.request : http.request;
+    this.http1Request = requestFn(requestOptions, response => {
+      this.http1Response = response;
+      response.on("data", chunk => eventStream.emit("data", chunk));
+      response.on("end", () => eventStream.emit("end"));
+      response.on("error", error => eventStream.emit("error", error));
+      response.on("aborted", () => eventStream.emit("error", new Error("Cursor RunSSE response was aborted")));
+      response.on("close", () => {
+        if (!response.complete) eventStream.emit("error", new Error("Cursor RunSSE response closed before completion"));
+      });
+      if (response.statusCode !== 200) {
+        response.resume();
+        eventStream.emit("error", new Error(`Cursor RunSSE returned HTTP ${response.statusCode ?? 0}`));
+        return;
+      }
+      const contentType = response.headers["content-type"]?.toLowerCase() ?? "";
+      if (!contentType.includes("application/connect+proto") && !contentType.includes("text/event-stream")) {
+        response.resume();
+        eventStream.emit("error", new Error("Cursor RunSSE returned an unsupported content type"));
+        return;
+      }
+      this.committed = true;
+      this.http1Ready = true;
+      debugProviderDiagnostic("cursor", "run-sse-open", {
+        transport: "http1-sse",
+        channel: "run_sse",
+        status: response.statusCode,
+        contentType: response.headers["content-type"],
+      });
+      const pending = this.http1PendingWrites.splice(0);
+      for (const payload of pending) {
+        void this.http1Append?.append(payload).catch(error => eventStream.emit("error", error));
+      }
+    });
+    this.http1Request.once("error", error => eventStream.emit("error", error));
+    const requestBody = encodeConnectFrame(toBinary(BidiRequestIdSchema, create(BidiRequestIdSchema, { requestId })));
+    this.http1Request.end(Buffer.from(requestBody));
+    // RunSSE is a long-lived request. Some HTTP/1.1 intermediaries buffer its
+    // response headers until the first body byte, so waiting for the response
+    // callback before the first BidiAppend would deadlock the two channels.
+    // The request body has been handed to the HTTP client at this point; append
+    // the initial message immediately and let the response callback validate
+    // the eventual status.
+    this.committed = true;
+    this.http1Ready = true;
+    const pending = this.http1PendingWrites.splice(0);
+    for (const payload of pending) {
+      void this.http1Append?.append(payload).catch(error => eventStream.emit("error", error));
+    }
+  }
+
   private open(
     encodedRequest: Uint8Array,
     signal: AbortSignal | undefined,
@@ -773,27 +904,32 @@ class LiveCursorTransport implements CursorTransport {
     this.firstFrameLogged = false;
     const dialHost = cursorHostLabel(this.input.provider.baseUrl || "https://api2.cursor.sh");
     debugProviderDiagnostic("cursor", "dial", { host: dialHost });
-    this.session = http2.connect(this.input.provider.baseUrl || "https://api2.cursor.sh");
-    // The run request is buffered until the HTTP/2 session connects. Failures before `connect`
-    // (DNS, ECONNREFUSED, TLS, connect timeout) mean the server never received the request, so they
-    // are safe to retry. Once connected, bytes flush to the server and the turn must not be replayed.
-    this.session.on("connect", () => {
-      this.committed = true;
-      debugProviderDiagnostic("cursor", "connected", { connectMs: Date.now() - this.turnStartedAt });
-    });
-    this.stream = this.session.request({
-      ":method": "POST",
-      ":path": CURSOR_RUN_PATH,
-      "content-type": "application/connect+proto",
-      "connect-protocol-version": "1",
-      te: "trailers",
-      authorization: `Bearer ${this.token}`,
-      "x-ghost-mode": "true",
-      "x-cursor-client-version": CURSOR_CLIENT_VERSION,
-      "x-cursor-client-type": "cli",
-      "x-request-id": crypto.randomUUID(),
-      "x-session-id": this.sessionId,
-    });
+    const useHttp1Sse = this.input.provider.cursorTransport === "http1-sse";
+    if (useHttp1Sse) {
+      this.openHttp1SseWire(signal);
+    } else {
+      this.session = http2.connect(this.input.provider.baseUrl || "https://api2.cursor.sh");
+      // The run request is buffered until the HTTP/2 session connects. Failures before `connect`
+      // (DNS, ECONNREFUSED, TLS, connect timeout) mean the server never received the request, so they
+      // are safe to retry. Once connected, bytes flush to the server and the turn must not be replayed.
+      this.session.on("connect", () => {
+        this.committed = true;
+        debugProviderDiagnostic("cursor", "connected", { connectMs: Date.now() - this.turnStartedAt });
+      });
+      this.stream = this.session.request({
+        ":method": "POST",
+        ":path": CURSOR_RUN_PATH,
+        "content-type": "application/connect+proto",
+        "connect-protocol-version": "1",
+        te: "trailers",
+        authorization: `Bearer ${this.token}`,
+        "x-ghost-mode": "true",
+        "x-cursor-client-version": CURSOR_CLIENT_VERSION,
+        "x-cursor-client-type": "cli",
+        "x-request-id": crypto.randomUUID(),
+        "x-session-id": this.sessionId,
+      });
+    }
 
     // Single-shot terminal owner for this turn (createTerminalSettler): stream error, session
     // error, trailers, end, abort, and the first-frame timeout all race into it, and only the
@@ -821,9 +957,10 @@ class LiveCursorTransport implements CursorTransport {
     };
     const session = this.session;
     const stream = this.stream;
+    if (!stream) throw new Error("Cursor transport stream was not initialized");
     // Session-level errors (TLS/socket/GOAWAY) do not always propagate to the stream listener;
     // without this handler they could bypass orderly failure reporting entirely.
-    session.on("error", err => {
+    session?.on("error", err => {
       const realErr = err instanceof Error ? err : new Error(String(err));
       debugProviderDiagnostic("cursor", "session-error", {
         code: String((realErr as { code?: unknown }).code ?? ""),
@@ -836,10 +973,12 @@ class LiveCursorTransport implements CursorTransport {
       this.firstFrameTimer = undefined;
       debugProviderDiagnostic("cursor", "first-frame-timeout", { timeoutMs: this.input.firstFrameTimeoutMs ?? CURSOR_FIRST_FRAME_TIMEOUT_MS });
       try { stream.close(); } catch { /* already closing */ }
-      try { session.close(); } catch { /* already closing */ }
+      try { session?.close(); } catch { /* already closing */ }
       // close() waits for in-flight frames; a dead socket can ignore it — force-destroy shortly
       // after so a stalled TLS session cannot linger past the timeout.
-      armTimeoutDestroyFallback(stream, session, this.input.timeoutDestroyGraceMs ?? CURSOR_TIMEOUT_DESTROY_GRACE_MS);
+      if (session) {
+        armTimeoutDestroyFallback(stream, session, this.input.timeoutDestroyGraceMs ?? CURSOR_TIMEOUT_DESTROY_GRACE_MS);
+      }
       releaseBacklogLease();
       settler.settleFail(new Error("Cursor transport timed out before first response"));
     }, this.input.firstFrameTimeoutMs ?? CURSOR_FIRST_FRAME_TIMEOUT_MS);
@@ -937,7 +1076,7 @@ class LiveCursorTransport implements CursorTransport {
           });
       }
     };
-    this.stream.on("data", chunk => {
+    stream.on("data", chunk => {
       this.clearFirstFrameTimer();
       // Once the turn has settled, late network bytes must never be charged —
       // the backlog lease is already released and nobody would own these.
@@ -967,12 +1106,12 @@ class LiveCursorTransport implements CursorTransport {
         failAndClear(err instanceof Error ? err : new Error(String(err)));
       }
     });
-    this.stream.on("trailers", trailers => {
+    stream.on("trailers", trailers => {
       const status = trailers["grpc-status"];
       if (status !== undefined) debugProviderDiagnostic("cursor", "trailers", { grpcStatus: String(status) });
       if (status && status !== "0") failAndClear(new Error(`Cursor gRPC error ${status}`));
     });
-    this.stream.on("error", err => {
+    stream.on("error", err => {
       const realErr = err instanceof Error ? err : new Error(String(err));
       if (this.expectedClose) {
         failAndClear(realErr);
@@ -991,7 +1130,7 @@ class LiveCursorTransport implements CursorTransport {
       });
       failAndClear(realErr);
     });
-    this.stream.on("end", () => {
+    stream.on("end", () => {
       this.clearFirstFrameTimer();
       debugProviderDiagnostic("cursor", "stream-end", {
         committed: this.committed,
@@ -1038,9 +1177,9 @@ class LiveCursorTransport implements CursorTransport {
       failAndClear(new Error("Cursor request was aborted"));
     }, { once: true });
 
-    this.stream.write(encodeConnectFrame(encodedRequest));
+    stream.write(encodeConnectFrame(encodedRequest));
     this.heartbeat = setInterval(() => {
-      this.stream?.write(encodeClientMessage({
+      stream.write(encodeClientMessage({
         message: { case: "clientHeartbeat", value: create(ClientHeartbeatSchema, {}) },
       }));
     }, HEARTBEAT_MS);
@@ -1051,84 +1190,19 @@ class LiveCursorTransport implements CursorTransport {
     state: ReturnType<typeof createCursorProtobufEventState>,
     push: (message: CursorServerMessage) => void,
   ): Promise<void> {
-    if (!this.stream) return;
-    debugProviderDiagnostic("cursor", "frame", describeCursorServerFrame(message));
-    if (message.message.case === "kvServerMessage") {
-      this.stream.write(encodeConnectFrame(handleCursorNativeKv(message.message.value, this.blobRequestScope)));
-      return;
-    }
-    if (message.message.case === "execServerMessage") {
-      const execMsg = message.message.value;
-      if (execMsg.message.case === "mcpArgs") {
-        const plan = planMcpArgsHandling(execMsg, state);
-        if (plan.handledByResponsesBridge) {
-          this.noteClientToolActivity();
-          for (const event of plan.events) push(event);
-          if (plan.cancelCursorRun) this.cancelCursorRun();
-          else if (plan.finalizeWhenDrained) this.scheduleClientToolFinalize(state, push);
-          return;
-        }
-      }
-      // Native exec/MCP is handled inside this transport and can mutate files/process state
-      // without emitting a Responses tool event. Mark the turn replay-unsafe before executing so
-      // an eventual invalid_argument cannot cause the adapter's fresh-conversation fallback to
-      // run the same local action twice.
-      push({ type: "local_side_effect" });
-      const replies = await handleCursorNativeExec(message.message.value, this.execContext);
-      for (const reply of replies) this.stream.write(encodeConnectFrame(reply));
-      return;
-    }
-    if (message.message.case === "interactionQuery") {
-      // The server-side agent BLOCKS until this query is answered with the matching id; leaving it
-      // unanswered is the proven stall → watchdog → upstream-502 mechanism. Reply immediately with
-      // the non-interactive default and emit liveness so the bridge watchdog sees progress.
-      const query = message.message.value;
-      const plan = planInteractionQueryReply(query);
-      debugProviderDiagnostic("cursor", "interaction-query", { id: query.id, queryCase: query.query.case ?? "unknown", reply: plan.replyCase });
-      this.stream.write(encodeClientMessage({ message: { case: "interactionResponse", value: plan.response } }));
-      if (!state.terminated) {
-        if (plan.planText) push({ type: "text", text: plan.planText });
-        push({ type: "heartbeat" });
-      }
-      return;
-    }
-    // A completion may carry only callId. Capture its ownership before mapping removes the open
-    // call, because the embedded-tool classifier cannot identify that valid compact frame.
-    const update = message.message.case === "interactionUpdate" ? message.message.value.message : undefined;
-    const completesOpenClientTool = update?.case === "toolCallCompleted"
-      && state.openToolCalls.has(update.value.callId);
-    const awaitedNativeArgsBeforeMapping = update?.case === "toolCallCompleted"
-      && state.openToolCalls.get(update.value.callId)?.awaitingNativeArgs === true;
-    const mapped = mapCursorProtobufServerMessage(message, state);
-    const beganAwaitingNativeClientToolArgs = update?.case === "toolCallCompleted"
-      && !awaitedNativeArgsBeforeMapping
-      && state.openToolCalls.get(update.value.callId)?.awaitingNativeArgs === true;
-    if (mapped.length > 0) {
-      // A client tool call announced/committed via interactionUpdate (toolCallStarted/partialToolCall/
-      // toolCallCompleted) changes the call set, so revoke any finalize armed by an earlier drain.
-      // A completion can also commit and drain a late call without a following mcpArgs frame; in
-      // that case re-arm finalization here so the Responses bridge does not wait forever.
-      const clientToolFrame = completesOpenClientTool || isClientToolFrame(message);
-      if (clientToolFrame) this.noteClientToolActivity();
-      for (const event of mapped) push(event);
-      if (
-        clientToolFrame
-        && state.openToolCalls.size === 0
-        && mapped.some(event => event.type === "tool_call_end")
-      ) this.scheduleClientToolFinalize(state, push);
-      return;
-    }
-    // The frame produced no outward Responses event (e.g. toolCallStarted / partialToolCall args
-    // buffering, a completion waiting for native args, toolCallDelta, tokenDelta, or a checkpoint
-    // update). Tool-call protocol events are deferred to completion for atomic, parallel-safe
-    // emission, so a turn that silently assembles several tool calls can otherwise exceed the
-    // bridge's stall watchdog (upstream_stall_timeout).
-    // Emit a liveness heartbeat for these progress frames so the watchdog sees the upstream is alive.
-    // Never after a terminal (done/truncation): a stray post-terminal frame must stay fully inert.
-    if (!state.terminated && (isCursorProgressFrame(message) || beganAwaitingNativeClientToolArgs)) {
-      if (isClientToolFrame(message) || beganAwaitingNativeClientToolArgs) this.noteClientToolActivity();
-      push({ type: "heartbeat" });
-    }
+    const stream = this.stream;
+    if (!stream) return;
+    await handleCursorServerMessage(message, state, push, {
+      execContext: this.execContext,
+      blobRequestScope: this.blobRequestScope,
+      writeClientMessage: payload => { stream.write(encodeConnectFrame(payload)); },
+      cancelCursorRun: () => this.cancelCursorRun(),
+      noteClientToolActivity: () => this.noteClientToolActivity(),
+      scheduleClientToolFinalize: (runtimeState, runtimePush) =>
+        this.scheduleClientToolFinalize(runtimeState, runtimePush),
+      planMcpArgsHandling,
+      planInteractionQueryReply,
+    });
   }
 }
 
@@ -1166,47 +1240,6 @@ function attachPartialUsage(failure: Error, state: ReturnType<typeof createCurso
  * Compact frame descriptor for provider debug (`ocx debug provider on`): outer case plus the inner
  * interactionUpdate/exec case and tool-call union case when present. No payload content is logged.
  */
-function describeCursorServerFrame(message: AgentServerMessage): Record<string, unknown> {
-  const out: Record<string, unknown> = { case: message.message.case ?? "unknown" };
-  if (message.message.case === "interactionUpdate") {
-    const update = message.message.value.message;
-    out.update = update.case ?? "unknown";
-    if (update.case === "toolCallStarted" || update.case === "partialToolCall" || update.case === "toolCallCompleted") {
-      out.toolCase = update.value.toolCall?.tool.case ?? "none";
-      out.callId = update.value.callId;
-    }
-  } else if (message.message.case === "execServerMessage") {
-    out.exec = message.message.value.message.case ?? "unknown";
-  } else if (message.message.case === "interactionQuery") {
-    out.query = message.message.value.query.case ?? "unknown";
-    out.id = message.message.value.id;
-  } else if (message.message.case === "kvServerMessage") {
-    out.kv = message.message.value.message.case ?? "unknown";
-  } else if (message.message.case === "conversationCheckpointUpdate") {
-    out.usedTokens = message.message.value.tokenDetails?.usedTokens ?? 0;
-  }
-  return out;
-}
-
-/**
- * True when a server frame represents real upstream progress that produced no outward Responses
- * event (so the bridge's stall watchdog would otherwise see silence). Covers tool-call assembly,
- * token/checkpoint accounting — the frames `mapCursorProtobufServerMessage` intentionally swallows.
- */
-function isCursorProgressFrame(message: AgentServerMessage): boolean {
-  if (message.message.case === "conversationCheckpointUpdate") return true;
-  if (message.message.case !== "interactionUpdate") return false;
-  switch (message.message.value.message.case) {
-    case "toolCallStarted":
-    case "partialToolCall":
-    case "toolCallDelta":
-    case "tokenDelta":
-      return true;
-    default:
-      return false;
-  }
-}
-
 /**
  * A tool-call lifecycle frame that can change the CLIENT tool call set (announce a new sibling or
  * commit one). Used to revoke a pending finalize so a late-announced parallel call is never dropped.

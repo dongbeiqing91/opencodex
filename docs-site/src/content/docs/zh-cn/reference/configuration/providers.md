@@ -110,6 +110,7 @@ selector，而不是分配一个新名称。
 | `googleMode?` | `"ai-studio" \| "vertex" \| "cloud-code-assist"` | Google 传输/身份验证模式。默认 `ai-studio`。 |
 | `project?` | `string` | Vertex 或 Antigravity Cloud Code Assist 项目 id。 |
 | `location?` | `string` | Vertex 位置；环境变量回退为 `GOOGLE_CLOUD_LOCATION`。 |
+| `cursorTransport?` | `"http2" \| "http1-sse"` | 仅 Cursor。默认为 HTTP/2；`http1-sse` 使用 HTTP/1.1 的 `RunSSE`/`BidiAppend` 分离传输，不启用轮询或自动回退。 |
 | `mcpServers?` | `Record<string, CursorMcpServerConfig>` | 仅 Cursor：stdio 或 Streamable HTTP MCP 服务器。 |
 | `desktopExecutor?` | `DesktopExecutorConfig` | 仅 Cursor：外部 computer-use 和录屏命令。 |
 | `unsafeAllowNativeLocalExec?` | `boolean` | Cursor 旧布尔值；仅当更新字段未设置时，等同于 `nativeLocalExec: "on"`。 |
@@ -245,13 +246,20 @@ Cursor 由服务端驱动的本地工具默认是禁用的。Codex 继续使用�
       "baseUrl": "https://api2.cursor.sh",
       "authMode": "oauth",
       "defaultModel": "auto",
+      "cursorTransport": "http1-sse",
       "nativeLocalExec": "off"
     }
   }
 }
 ```
 
-请将该字段设置在 `providers.cursor` 上，而不是顶层。在仪表板中，使用 **Providers → Cursor → Edit JSON**，保存，然后重启。旧的 `unsafeAllowNativeLocalExec: true` 仅在未设置 `nativeLocalExec` 时，才等同于 `nativeLocalExec: "on"`。MCP、屏幕录制和 computer use 由 `mcpServers` 和 `desktopExecutor` 单独控制。
+请将这些字段设置在 `providers.cursor` 上，而不是顶层。`cursorTransport` 默认为
+`"http2"`；当网络无法承载 Cursor 的 HTTP/2 流时，将其设置为 `"http1-sse"`。该模式通过
+HTTP/1.1 使用 `AgentService/RunSSE` 的二进制 Connect 响应帧和有序的
+`BidiService/BidiAppend` 请求，不启用轮询，也不会自动回退到 HTTP/2。在仪表板中，使用
+**Providers → Cursor → Edit JSON**，保存，然后重启。旧的 `unsafeAllowNativeLocalExec: true`
+仅在未设置 `nativeLocalExec` 时，才等同于 `nativeLocalExec: "on"`。MCP、屏幕录制和 computer
+use 由 `mcpServers` 和 `desktopExecutor` 单独控制。
 
 每个 `mcpServers.<name>` 都可以接受 `command`（stdio）或 `url`（Streamable HTTP）。stdio 还接受 `args`、`env` 和 `cwd`；HTTP 接受 `headers`。两者都支持 `enabled`（默认 true）和 `toolPrefix`。`desktopExecutor` 接受 `computerUseCommand`、`recordScreenCommand`、`cwd`、`env` 和 `timeoutMs`（默认 `30000`）。命令通过 `sh -c` 执行，从 stdin 读取一个 JSON 请求，并且必须向 stdout 写入一个 JSON 结果。
 

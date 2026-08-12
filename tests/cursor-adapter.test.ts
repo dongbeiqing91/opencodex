@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
   createCursorAdapter as createCursorAdapterProduction,
   cursorExecDeniedMessage,
+  selectCursorTransportFactory,
 } from "../src/adapters/cursor";
 import {
   clearCursorThreadContinuityForTests,
@@ -33,6 +34,14 @@ async function collect(gen: AsyncGenerator<AdapterEvent>): Promise<AdapterEvent[
 }
 
 describe("Cursor adapter live transport", () => {
+  test("selects HTTP/1.1 SSE only when explicitly configured", () => {
+    expect(selectCursorTransportFactory({ ...provider, cursorTransport: "http1-sse" }).name)
+      .toBe("createHttp1SseCursorTransport");
+    expect(selectCursorTransportFactory({ ...provider, cursorTransport: "http2" }).name)
+      .toBe("createLiveCursorTransport");
+    expect(selectCursorTransportFactory(provider).name).toBe("createLiveCursorTransport");
+  });
+
   test("runTurn emits a missing-token error before live network", async () => {
     const adapter = createCursorAdapter(provider);
     const events: AdapterEvent[] = [];

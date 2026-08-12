@@ -127,6 +127,16 @@ function applyProviderPatchFields(
     next.adapter = rawBody.adapter.trim();
     touched = true;
   }
+  if (Object.hasOwn(rawBody, "cursorTransport")) {
+    if (rawBody.cursorTransport === null || rawBody.cursorTransport === "") {
+      delete next.cursorTransport;
+    } else if (rawBody.cursorTransport === "http2" || rawBody.cursorTransport === "http1-sse") {
+      next.cursorTransport = rawBody.cursorTransport;
+    } else {
+      return { error: "cursorTransport must be http2 or http1-sse, or null to clear" };
+    }
+    touched = true;
+  }
   if (Object.hasOwn(rawBody, "baseUrl")) {
     if (typeof rawBody.baseUrl !== "string" || !rawBody.baseUrl.trim()) return { error: "baseUrl must be a non-empty string" };
     next.baseUrl = rawBody.baseUrl.trim();
@@ -391,6 +401,7 @@ export async function handleProviderRoutes(ctx: ManagementContext): Promise<Resp
       upstreamHttpVersion: p.upstreamHttpVersion,
       authMode: p.authMode,
       apiKeyTransport: p.apiKeyTransport,
+      cursorTransport: p.cursorTransport,
       disabled: p.disabled === true,
       codexAccountMode: providerCodexAccountMode(name, p),
       discovery: p.liveModels === false ? undefined : getProviderDiscoveryStatus(name),

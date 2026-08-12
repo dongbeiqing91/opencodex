@@ -186,7 +186,9 @@ advertised effort control on those models as proof of upstream-native reasoning 
 
 ## `cursor`
 
-**Targets:** Cursor's `agent.v1.AgentService/Run` over HTTP/2 Connect streaming at `api2.cursor.sh`.
+**Targets:** Cursor's `agent.v1.AgentService/Run` over HTTP/2 Connect streaming by default, or the
+HTTP/1.1 `RunSSE`/`BidiAppend` split transport when `providers.cursor.cursorTransport` is
+`"http1-sse"`.
 **Auth:** Cursor OAuth/access token from `provider.apiKey` or the forwarded authorization header.
 
 - Uses `runTurn` rather than the ordinary fetch/parse path. Requests, server events, tool arguments,
@@ -195,6 +197,8 @@ advertised effort control on those models as proof of upstream-native reasoning 
 - Replays conversation state through content-addressed blobs, maps server tool calls back to Codex,
   discovers live Cursor models through the protobuf `GetUsableModels` RPC, and retries only before a
   run request is committed to the wire.
+- The HTTP/1.1 mode sends binary Connect frames despite the `RunSSE` name and does not use textual
+  SSE parsing. It is explicit and has no polling or automatic HTTP/2 fallback.
 - Exposes Cursor Router as `cursor/auto` plus explicit `cursor/auto-cost`,
   `cursor/auto-balance`, and `cursor/auto-intelligence` entries. Explicit levels are encoded in
   `requested_model.parameters` while the legacy `cursor/auto` entry retains the account/team default.
