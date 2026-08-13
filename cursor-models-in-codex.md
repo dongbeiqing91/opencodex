@@ -29,7 +29,7 @@ If the network cannot carry Cursor's HTTP/2 agent stream, configure the provider
 Install opencodex, then run the setup wizard:
 
 ```bash
-npm install -g @bitkyc08/opencodex
+npm install -g .
 ocx init
 ```
 

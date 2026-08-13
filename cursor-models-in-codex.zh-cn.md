@@ -25,7 +25,7 @@ description: 通过 opencodex 将 Cursor 账户可用的模型路由到 Codex CL
 安装 opencodex，然后运行初始化向导：
 
 ```bash
-npm install -g @bitkyc08/opencodex
+npm install -g .
 ocx init
 ```
 
