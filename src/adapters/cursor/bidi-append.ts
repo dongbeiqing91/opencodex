@@ -181,6 +181,13 @@ export function createBidiAppendClient(options: BidiAppendClientOptions): BidiAp
     async close() {
       if (closed) return;
       closed = true;
+      // Give in-flight appends a brief grace period to complete before
+      // destroying their sockets, so the server does not observe a reset
+      // on a request it may have already accepted.
+      const graceMs = 250;
+      if (activeRequests.size > 0) {
+        await new Promise(resolve => setTimeout(resolve, graceMs));
+      }
       for (const request of activeRequests) request.destroy();
       for (const response of activeResponses) response.destroy();
     },

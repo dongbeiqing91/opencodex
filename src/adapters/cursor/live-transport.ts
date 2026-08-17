@@ -715,6 +715,10 @@ class LiveCursorTransport implements CursorTransport {
     this.http1Response?.destroy();
     this.http1Ready = false;
     this.http1PendingWrites = [];
+    // cancelCursorRun is called from sync contexts; fire-and-forget the
+    // graceful close so we do not block the caller, but the 250 ms grace
+    // inside BidiAppendClient.close() still gives in-flight appends a
+    // chance to complete before the sockets are destroyed.
     void this.http1Append?.close();
     this.releaseBlobRequestScope();
     this.releaseMcpObservation?.();
@@ -793,6 +797,14 @@ class LiveCursorTransport implements CursorTransport {
         }
         const payload = decoded.frames[0]!.payload.slice();
         if (!this.http1Ready) {
+          // The first client message must be sent immediately even before the
+          // RunSSE response arrives, because some intermediaries buffer the
+          // response headers until the first BidiAppend body byte. Without
+          // this eager send the two channels deadlock.
+          if (this.http1PendingWrites.length === 0) {
+            void this.http1Append?.append(payload).catch(error => eventStream.emit("error", error));
+            return true;
+          }
           this.http1PendingWrites.push(payload);
         } else {
           void this.http1Append?.append(payload).catch(error => eventStream.emit("error", error));
@@ -879,11 +891,11 @@ class LiveCursorTransport implements CursorTransport {
     // RunSSE is a long-lived request. Some HTTP/1.1 intermediaries buffer its
     // response headers until the first body byte, so waiting for the response
     // callback before the first BidiAppend would deadlock the two channels.
-    // The request body has been handed to the HTTP client at this point; append
-    // the initial message immediately and let the response callback validate
-    // the eventual status.
-    this.committed = true;
-    this.http1Ready = true;
+    // The request body has been handed to the HTTP client at this point; flush
+    // any queued initial message immediately so the server starts streaming,
+    // but keep http1Ready=false until the response callback validates the
+    // status. Writes that arrive after this point but before the callback are
+    // queued normally and flushed once the response is confirmed.
     const pending = this.http1PendingWrites.splice(0);
     for (const payload of pending) {
       void this.http1Append?.append(payload).catch(error => eventStream.emit("error", error));
