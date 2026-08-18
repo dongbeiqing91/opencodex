@@ -282,6 +282,54 @@ describe("Cursor HTTP/1.1 SSE transport", () => {
     expect(failure).toBeDefined();
   });
 
+  test("tolerates a reset that races the Connect end-stream after turnEnded", async () => {
+    // The production race: turnEnded is received and pushed, then the socket resets BEFORE the
+    // Connect end-stream frame arrives. The drain must process turnEnded (pushing `done`) so
+    // the reset is classified as post-terminal noise, not a turn failure.
+    const server = createServer(async (request, response) => {
+      await readBody(request);
+      if (request.url === "/agent.v1.AgentService/RunSSE") {
+        response.writeHead(200, { "content-type": "application/connect+proto" });
+        response.write(Buffer.from(textDeltaFrame("OK")));
+        response.write(Buffer.from(turnEndedFrame()), () => {
+          // Reset immediately after turnEnded is written, before any end-stream frame.
+          setTimeout(() => response.socket.destroy(), 20);
+        });
+        return;
+      }
+      if (request.url === "/aiserver.v1.BidiService/BidiAppend") {
+        response.writeHead(200, { "content-type": "application/proto" });
+        response.end();
+        return;
+      }
+      response.writeHead(404);
+      response.end();
+    });
+    const port = await boundPort(server);
+    const transport = createTestTransport(port);
+
+    const messages = [];
+    let failure: Error | undefined;
+    try {
+      for await (const message of transport.run({
+        modelId: "composer-2.5",
+        conversationId: "http1-reset-between-terminal-and-endstream",
+        system: [],
+        messages: [{ role: "user", content: "hello" }],
+      })) {
+        messages.push(message);
+      }
+    } catch (error) {
+      failure = error instanceof Error ? error : new Error(String(error));
+    } finally {
+      await transport.close?.();
+    }
+
+    expect(failure).toBeUndefined();
+    expect(messages).toContainEqual({ type: "text", text: "OK" });
+    expect(messages).toMatchObject([{ type: "text", text: "OK" }, { type: "done" }]);
+  });
+
   test("reports an incomplete Connect frame from the HTTP/1.1 response", async () => {
     const server = createServer(async (request, response) => {
       await readBody(request);

@@ -124,7 +124,7 @@ differing backup and rewrites known legacy namespaced selected ids to bare ids.
 | `googleMode?` | `"ai-studio" \| "vertex" \| "cloud-code-assist"` | Google transport/auth mode. Default `ai-studio`. |
 | `project?` | `string` | Vertex or Antigravity Cloud Code Assist project id. |
 | `location?` | `string` | Vertex location; environment fallback is `GOOGLE_CLOUD_LOCATION`. |
-| `cursorTransport?` | `"http2" \| "http1-sse"` | Cursor only. Defaults to HTTP/2; `http1-sse` uses the HTTP/1.1 `RunSSE`/`BidiAppend` split transport without polling or automatic fallback. |
+| `cursorTransport?` | `"http2" \| "http1-sse"` | Cursor only. Defaults to HTTP/2; `http1-sse` uses the HTTP/1.1 `RunSSE`/`BidiAppend` split transport without polling or automatic fallback. Live `GetUsableModels` discovery narrows each model's reasoning-effort ladder to the tiers the account can use; degraded discovery falls back to the static registry ladder. |
 | `mcpServers?` | `Record<string, CursorMcpServerConfig>` | Cursor only: stdio or Streamable HTTP MCP servers. |
 | `desktopExecutor?` | `DesktopExecutorConfig` | Cursor only: external computer-use and record-screen commands. |
 | `unsafeAllowNativeLocalExec?` | `boolean` | Cursor legacy boolean, equivalent to `nativeLocalExec: "on"` only when the newer field is unset. |

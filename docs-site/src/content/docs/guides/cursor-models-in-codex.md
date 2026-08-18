@@ -23,6 +23,31 @@ If the network cannot carry Cursor's HTTP/2 agent stream, set
 response stream and ordered `BidiAppend` requests. It does not enable polling or automatic
 transport fallback.
 
+## Effort tiers and live discovery
+
+Cursor model ids encode the reasoning effort as a suffix (`claude-4.6-opus-high`). The tiers an
+account can use differ per model and per subscription. opencodex derives the Codex picker ladder
+from the account's live `GetUsableModels` response, so the catalog only advertises effort tiers
+the account can actually use. A model whose family supports `max` but whose account only
+exposes `high` will show only `high` in Codex; selecting `max` would otherwise make Cursor
+reject the turn with `failed_precondition` or `not_found`.
+
+When live discovery is unavailable (logged out, network blocked, or discovery cooling down),
+opencodex falls back to the static registry ladder and keeps the full tier set so the catalog
+is not empty. The picker narrows again once live discovery succeeds.
+
+## Transport diagnostics
+
+Provider debug logging (`ocx debug provider on` or `OCX_DEBUG=1`) distinguishes normal
+teardown from real failures on the HTTP/1.1 wire:
+
+- `post-terminal-close` and `stream-cancel-expected` are benign: the turn completed
+  (`turnEnded` was received) and the connection reset that followed is noise from the
+  HTTP/1.1 teardown, not a failure.
+- `turn-failed` without a preceding `turnEnded` is a genuine mid-turn truncation.
+- `failed_precondition` or `not_found` from the Cursor Connect trailer means the model
+  or effort tier is not available to the account; switch to a tier the account exposes.
+
 ## Quick start
 
 ### Fresh installation

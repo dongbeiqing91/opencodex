@@ -1,6 +1,8 @@
 import {
   CANONICAL_EFFORT_SUFFIXES,
+  CODEX_EFFORT_ORDER,
   cursorModelEffortLadder,
+  cursorModelHasEffortTiers,
   cursorWireModelIdWithEffort,
 } from "./effort-map";
 
@@ -166,6 +168,60 @@ export function filterCursorConfiguredModelsByLiveDiscovery<T extends { id: stri
 ): T[] {
   return configured.filter(model =>
     isCursorRouterModelId(model.id) || isCursorModelAvailableForAccount(model.id, liveIds),
+  );
+}
+
+/**
+ * Derive the effort ladder for a Cursor base model from the exact live `GetUsableModels` ids.
+ *
+ * Returns the observed effort suffixes in canonical Codex order
+ * (low < medium < high < xhigh < max), or an empty array when the model has static effort
+ * tiers but no suffixed live variants were observed. Returns `undefined` for models that
+ * have no static effort tiers (bare-id models like `composer-2.5`).
+ *
+ * Matching mirrors {@link isCursorModelAvailableForAccount}: the optional `cursor-` wire
+ * prefix is stripped, and both the normal `{base}-{effort}` form and the Grok Fast
+ * `{base-without-fast}-{effort}-fast` / legacy `{base}-fast-{effort}` forms are recognized.
+ * Sibling models (e.g. `gpt-5.5-extra-high` for base `gpt-5.5`) never activate a
+ * different base model's ladder because the match is exact against the composed ids.
+ */
+export function cursorLiveEffortLadder(
+  baseModelId: string,
+  liveIds: readonly string[],
+): string[] | undefined {
+  if (!cursorModelHasEffortTiers(baseModelId)) return undefined;
+  const observed = new Set<string>();
+  for (const raw of liveIds) {
+    const id = stripCursorWirePrefix(raw);
+    if (id === baseModelId) continue; // bare id, no effort suffix to extract
+    for (const effort of CANONICAL_EFFORT_SUFFIXES) {
+      if (effort === "none") continue;
+      if (
+        id === `${baseModelId}-${effort}` ||
+        id === cursorWireModelIdWithEffort(baseModelId, effort)
+      ) {
+        observed.add(effort);
+      }
+    }
+  }
+  return CODEX_EFFORT_ORDER.filter(effort => observed.has(effort));
+}
+
+/**
+ * Build a per-model effort ladder map from live `GetUsableModels` ids, scoped to the
+ * configured (discovery-filtered) models. Models without static effort tiers get an empty
+ * ladder; models with static tiers but no observed suffixed variants also get an empty
+ * ladder, so Codex does not advertise effort choices the account cannot use.
+ */
+export function cursorLiveReasoningEfforts<T extends { id: string }>(
+  configured: readonly T[],
+  liveIds: readonly string[],
+): Record<string, string[]> {
+  return Object.fromEntries(
+    configured.map(model => [
+      model.id,
+      cursorLiveEffortLadder(model.id, liveIds) ?? [],
+    ]),
   );
 }
 

@@ -42,7 +42,7 @@ import { parseAntigravityAvailableModels } from "../../providers/antigravity-mod
 import { applyProviderContextCap, providerContextCap } from "../../providers/context-cap";
 import { routedSlug, slugEquals, slugsEquivalent } from "../../providers/slug-codec";
 import { CODEX_GPT5_IDENTITY_LINE } from "../../adapters/identity";
-import { filterCursorConfiguredModelsByLiveDiscovery } from "../../adapters/cursor/discovery";
+import { cursorLiveEffortLadder, filterCursorConfiguredModelsByLiveDiscovery } from "../../adapters/cursor/discovery";
 import { fetchCursorUsableModels } from "../../adapters/cursor/live-models";
 import { isCanonicalOpenAiForwardProvider, OPENAI_API_PROVIDER_ID, OPENAI_CODEX_PROVIDER_ID } from "../../providers/openai-tiers";
 import {
@@ -693,6 +693,48 @@ export function applyConfigHintsToCachedModels(name: string, prov: OcxProviderCo
   return models.map(model => applyProviderConfigHints(name, prov, model, contextCap));
 }
 
+/**
+ * Override `reasoningEfforts` on Cursor catalog models with ladders derived from the
+ * account's live `GetUsableModels` ids. The static registry ladder advertises every tier
+ * the model family supports, but an account may only have a subset (e.g. `glm-5.2-high`
+ * without `glm-5.2-max`). Advertising tiers the account cannot use leads to
+ * `failed_precondition` rejections when Codex sends them.
+ *
+ * Models without static effort tiers (bare-id models like `composer-2.5`) are left
+ * unchanged — `cursorLiveEffortLadder` returns `undefined` for them. Models whose
+ * static tiers exist but have no live suffixed variants get an empty ladder so Codex
+ * does not advertise effort choices the account cannot use.
+ *
+ * `defaultReasoningEffort` is clamped to the top observed tier when the static default
+ * is no longer in the ladder, preventing a stale `max` from surviving when only
+ * `high` is available.
+ */
+export function applyCursorLiveEffortLadders(
+  models: readonly CatalogModel[],
+  liveIds: readonly string[],
+): CatalogModel[] {
+  return models.map(model => {
+    const ladder = cursorLiveEffortLadder(model.id, liveIds);
+    if (ladder === undefined) return model; // bare model, keep static (no tiers)
+    const defaultEffort = model.defaultReasoningEffort;
+    if (ladder.length === 0) {
+      // Model has static tiers but no live suffixed variants — clear the ladder and
+      // drop any default that is no longer selectable.
+      if (defaultEffort === undefined) return { ...model, reasoningEfforts: [] };
+      const { defaultReasoningEffort: _drop, ...rest } = model;
+      return { ...rest, reasoningEfforts: [] };
+    }
+    const clampedDefault = defaultEffort && !ladder.includes(defaultEffort)
+      ? ladder[ladder.length - 1]
+      : defaultEffort;
+    return {
+      ...model,
+      reasoningEfforts: [...ladder],
+      ...(clampedDefault !== defaultEffort ? { defaultReasoningEffort: clampedDefault } : {}),
+    };
+  });
+}
+
 
 /**
  * Last-resort context window for combo member synthesis when discovery and
@@ -1212,9 +1254,15 @@ async function fetchProviderModelsWithAuth(
     if (liveResult.ok) {
       const available = filterCursorConfiguredModelsByLiveDiscovery(configured, liveResult.models);
       const result = available.length > 0 ? available : configured;
+      // Override reasoningEfforts with ladders derived from the account's live
+      // GetUsableModels ids so the catalog only advertises effort tiers the account
+      // can actually use. Apply before retention so the live models carry the correct
+      // ladder into the merge; configured-only models (combo targets, etc.) keep the
+      // static ladder.
+      const withLiveEfforts = applyCursorLiveEffortLadders(result, liveResult.models);
       // Cache the discovery-filtered roster without combo retention so a later
       // gather can re-apply the current capture's retain set on read.
-      const forCache = withConfiguredRetention(result, { retainComboTargets: false });
+      const forCache = withConfiguredRetention(withLiveEfforts, { retainComboTargets: false });
       if (!setCached(name, forCache, Date.now(), cacheGeneration)) {
         return observed(withConfiguredRetention(configured), "degraded");
       }

@@ -9,6 +9,7 @@ import {
   findNativeTemplate,
 } from "../src/codex/catalog/parsing";
 import { withStubbedProviderFetch } from "./helpers/catalog-provider-fetch";
+import { applyCursorLiveEffortLadders } from "../src/codex/catalog/provider-fetch";
 import {
   CURSOR_STATIC_MODELS,
   filterCursorConfiguredModelsByLiveDiscovery,
@@ -3478,6 +3479,61 @@ describe("Codex catalog routed normalization", () => {
       "auto-intelligence",
       "gpt-5.4",
     ]);
+  });
+
+  test("applyCursorLiveEffortLadders narrows reasoning efforts to live-observed tiers", () => {
+    // Static catalog models carry the full registry ladder. Live discovery may show
+    // only a subset of tiers the account can use — the catalog must not advertise
+    // tiers the account cannot use (they fail with failed_precondition/not_found).
+    const staticModels: CatalogModel[] = [
+      { provider: "cursor", id: "auto", reasoningEfforts: [] },
+      { provider: "cursor", id: "composer-2.5", reasoningEfforts: [] },
+      { provider: "cursor", id: "glm-5.2", reasoningEfforts: ["high", "max"], defaultReasoningEffort: "max" },
+      { provider: "cursor", id: "gpt-5.6-terra", reasoningEfforts: ["low", "medium", "high", "xhigh", "max"], defaultReasoningEffort: "max" },
+      { provider: "cursor", id: "claude-opus-4-8", reasoningEfforts: ["low", "medium", "high", "xhigh", "max"] },
+    ];
+    const liveIds = [
+      "default",
+      "composer-2.5",
+      "glm-5.2-high",
+      "gpt-5.6-terra-low",
+      "gpt-5.6-terra-high",
+      "claude-opus-4-8-low",
+      "claude-opus-4-8-medium",
+      "claude-opus-4-8-high",
+      "claude-opus-4-8-xhigh",
+      "claude-opus-4-8-max",
+    ];
+    const result = applyCursorLiveEffortLadders(staticModels, liveIds);
+
+    // Bare-id models (auto, composer) keep their empty ladder unchanged.
+    expect(result.find(m => m.id === "auto")?.reasoningEfforts).toEqual([]);
+    expect(result.find(m => m.id === "composer-2.5")?.reasoningEfforts).toEqual([]);
+
+    // glm-5.2: only `high` observed → ladder is ["high"], default clamped from `max` to `high`.
+    const glm = result.find(m => m.id === "glm-5.2");
+    expect(glm?.reasoningEfforts).toEqual(["high"]);
+    expect(glm?.defaultReasoningEffort).toBe("high");
+
+    // gpt-5.6-terra: only low/high observed → max and xhigh dropped, default clamped to high.
+    const terra = result.find(m => m.id === "gpt-5.6-terra");
+    expect(terra?.reasoningEfforts).toEqual(["low", "high"]);
+    expect(terra?.defaultReasoningEffort).toBe("high");
+
+    // claude-opus-4-8: all tiers observed → ladder unchanged.
+    const opus = result.find(m => m.id === "claude-opus-4-8");
+    expect(opus?.reasoningEfforts).toEqual(["low", "medium", "high", "xhigh", "max"]);
+  });
+
+  test("applyCursorLiveEffortLadders clears the ladder when no suffixed variants are live", () => {
+    const staticModels: CatalogModel[] = [
+      { provider: "cursor", id: "glm-5.2", reasoningEfforts: ["high", "max"], defaultReasoningEffort: "max" },
+    ];
+    // Only the bare id is live — no effort variants for this account.
+    const result = applyCursorLiveEffortLadders(staticModels, ["glm-5.2"]);
+    const glm = result.find(m => m.id === "glm-5.2");
+    expect(glm?.reasoningEfforts).toEqual([]);
+    expect(glm?.defaultReasoningEffort).toBeUndefined();
   });
 
   test("liveModels false ignores a fresh live-model cache", async () => {

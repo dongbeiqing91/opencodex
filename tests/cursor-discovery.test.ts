@@ -8,6 +8,8 @@ import {
   cursorCodexToWireModelId,
   filterCursorConfiguredModelsByLiveDiscovery,
   isCursorModelAvailableForAccount,
+  cursorLiveEffortLadder,
+  cursorLiveReasoningEfforts,
   cursorModelContextWindows,
   cursorModelIds,
   cursorModelInputModalities,
@@ -186,5 +188,79 @@ describe("Cursor discovery metadata", () => {
     expect(isCursorExternalWireModel("gpt-5.6-sol-xhigh")).toBe(true);
     expect(isCursorExternalWireModel("claude-4.6-sonnet-high")).toBe(true);
     expect(isCursorExternalWireModel("cursor/gpt-5.6-sol")).toBe(true);
+  });
+
+  test("cursorLiveEffortLadder derives observed tiers from exact live ids", () => {
+    // Normal base model: only observed suffixes appear, in canonical order.
+    expect(cursorLiveEffortLadder("glm-5.2", ["glm-5.2-high"])).toEqual(["high"]);
+    expect(cursorLiveEffortLadder("glm-5.2", ["glm-5.2-high", "glm-5.2-max"])).toEqual(["high", "max"]);
+    // Missing tiers are not surfaced even when the static catalog advertises them.
+    expect(cursorLiveEffortLadder("gpt-5.6-terra", ["gpt-5.6-terra-low", "gpt-5.6-terra-high"]))
+      .toEqual(["low", "high"]);
+    // glm-5.3-max absent from live ids → max is not exposed.
+    expect(cursorLiveEffortLadder("glm-5.3", ["glm-5.3-low", "glm-5.3-high"]))
+      .toEqual(["low", "high"]);
+    // All tiers present.
+    expect(cursorLiveEffortLadder("claude-opus-4-8", [
+      "claude-opus-4-8-low", "claude-opus-4-8-medium",
+      "claude-opus-4-8-high", "claude-opus-4-8-xhigh", "claude-opus-4-8-max",
+    ])).toEqual(["low", "medium", "high", "xhigh", "max"]);
+  });
+
+  test("cursorLiveEffortLadder handles cursor- prefix and Grok Fast forms", () => {
+    // cursor- wire prefix is stripped before matching.
+    expect(cursorLiveEffortLadder("grok-4.6", ["cursor-grok-4.6-low", "cursor-grok-4.6-xhigh"]))
+      .toEqual(["low", "xhigh"]);
+    // Current Grok Fast form: {base-without-fast}-{effort}-fast.
+    expect(cursorLiveEffortLadder("grok-4.6-fast", ["cursor-grok-4.6-low-fast", "cursor-grok-4.6-xhigh-fast"]))
+      .toEqual(["low", "xhigh"]);
+    // Legacy Grok Fast form: {base}-fast-{effort}.
+    expect(cursorLiveEffortLadder("grok-4.5-fast", ["grok-4.5-fast-medium"]))
+      .toEqual(["medium"]);
+  });
+
+  test("cursorLiveEffortLadder rejects sibling models", () => {
+    // gpt-5.5-extra-high must not activate gpt-5.5's ladder (gpt-5.5 has static tiers).
+    expect(cursorLiveEffortLadder("gpt-5.5", ["gpt-5.5-extra-high"])).toEqual([]);
+    // claude-4-sonnet-1m must not activate claude-4-sonnet's ladder. claude-4-sonnet is a
+    // bare model (no static tiers), so the helper returns undefined — the sibling id is
+    // irrelevant.
+    expect(cursorLiveEffortLadder("claude-4-sonnet", ["claude-4-sonnet-1m"])).toBeUndefined();
+    // gpt-5.6-sol is a tiered model; a different gpt-5.6-* sibling must not activate it.
+    expect(cursorLiveEffortLadder("gpt-5.6-sol", ["gpt-5.6-terra-high"])).toEqual([]);
+  });
+
+  test("cursorLiveEffortLadder returns undefined for bare-id models and empty for unobserved tiers", () => {
+    // Models without static effort tiers (composer, auto) return undefined.
+    expect(cursorLiveEffortLadder("composer-2.5", ["composer-2.5"])).toBeUndefined();
+    expect(cursorLiveEffortLadder("auto", ["default"])).toBeUndefined();
+    // Models with static tiers but no live suffixed variants return an empty ladder.
+    expect(cursorLiveEffortLadder("glm-5.2", ["glm-5.2"])).toEqual([]);
+    expect(cursorLiveEffortLadder("glm-5.2", [])).toEqual([]);
+  });
+
+  test("cursorLiveReasoningEfforts builds a per-model ladder map from live ids", () => {
+    const configured = [
+      { id: "auto" },
+      { id: "composer-2.5" },
+      { id: "glm-5.2" },
+      { id: "gpt-5.6-terra" },
+      { id: "claude-fable-5" },
+    ];
+    const liveIds = [
+      "default",
+      "composer-2.5",
+      "glm-5.2-high",
+      "gpt-5.6-terra-low",
+      "gpt-5.6-terra-high",
+      // claude-fable-5 absent → filtered out by filterCursorConfiguredModelsByLiveDiscovery,
+      // but the map helper still returns an empty ladder for it.
+    ];
+    const efforts = cursorLiveReasoningEfforts(configured, liveIds);
+    expect(efforts.auto).toEqual([]);
+    expect(efforts["composer-2.5"]).toEqual([]);
+    expect(efforts["glm-5.2"]).toEqual(["high"]);
+    expect(efforts["gpt-5.6-terra"]).toEqual(["low", "high"]);
+    expect(efforts["claude-fable-5"]).toEqual([]);
   });
 });

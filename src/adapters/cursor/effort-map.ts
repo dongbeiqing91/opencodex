@@ -65,6 +65,9 @@ export const CANONICAL_EFFORT_SUFFIXES: ReadonlySet<string> = new Set([
 
 const CANONICAL_CODEX_EFFORT_ORDER = ["low", "medium", "high", "xhigh", "max"] as const;
 
+/** Canonical Codex reasoning-effort ordering (low < medium < high < xhigh < max). */
+export const CODEX_EFFORT_ORDER: readonly string[] = CANONICAL_CODEX_EFFORT_ORDER;
+
 function normalizeRequestedEffort(reasoning: string | undefined): string | undefined {
   const normalized = reasoning?.toLowerCase();
   return normalized === "ultra" ? "max" : normalized;
