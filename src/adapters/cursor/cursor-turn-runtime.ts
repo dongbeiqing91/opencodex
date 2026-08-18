@@ -101,7 +101,15 @@ export async function handleCursorServerMessage(
   const update = message.message.case === "interactionUpdate" ? message.message.value.message : undefined;
   const completesOpenClientTool = update?.case === "toolCallCompleted"
     && state.openToolCalls.has(update.value.callId);
+  // Capture the awaiting flag before mapping: a completion-only freeform frame that starts
+  // awaiting native args produces no outward event, and the flag transition is the only signal
+  // that the frame made progress worth a liveness heartbeat.
+  const awaitedNativeArgsBeforeMapping = update?.case === "toolCallCompleted"
+    && state.openToolCalls.get(update.value.callId)?.awaitingNativeArgs === true;
   const mapped = mapCursorProtobufServerMessage(message, state);
+  const beganAwaitingNativeClientToolArgs = update?.case === "toolCallCompleted"
+    && !awaitedNativeArgsBeforeMapping
+    && state.openToolCalls.get(update.value.callId)?.awaitingNativeArgs === true;
   if (mapped.length > 0) {
     const clientToolFrame = completesOpenClientTool || isClientToolFrame(message);
     if (clientToolFrame) context.noteClientToolActivity();
@@ -113,8 +121,11 @@ export async function handleCursorServerMessage(
     ) context.scheduleClientToolFinalize(state, push);
     return;
   }
-  if (!state.terminated && isCursorProgressFrame(message)) {
-    if (isClientToolFrame(message)) context.noteClientToolActivity();
+  // Frames that produce no outward Responses event (args buffering, a completion now waiting
+  // for native args, tokenDelta, checkpoints) still prove the upstream is alive; without the
+  // heartbeat the bridge's stall watchdog can trip upstream_stall_timeout mid-turn.
+  if (!state.terminated && (isCursorProgressFrame(message) || beganAwaitingNativeClientToolArgs)) {
+    if (isClientToolFrame(message) || beganAwaitingNativeClientToolArgs) context.noteClientToolActivity();
     push({ type: "heartbeat" });
   }
 }

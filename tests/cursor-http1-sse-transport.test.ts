@@ -6,6 +6,7 @@ import { encodeConnectFrame } from "../src/adapters/cursor/framing";
 import {
   AgentServerMessageSchema,
   InteractionUpdateSchema,
+  TextDeltaUpdateSchema,
 } from "../src/adapters/cursor/gen/agent_pb";
 import { createTestTranslatorBudget } from "./helpers/translator-budget";
 
@@ -38,6 +39,53 @@ function respondEmptyConnectMessage(response: ServerResponse): void {
     response.write(firstFrame.subarray(offset, offset + 1));
   }
   response.end(encodeConnectFrame(new TextEncoder().encode("{}"), { endStream: true }));
+}
+
+function textDeltaFrame(text: string): Uint8Array {
+  return encodeConnectFrame(toBinary(AgentServerMessageSchema, create(AgentServerMessageSchema, {
+    message: {
+      case: "interactionUpdate",
+      value: create(InteractionUpdateSchema, {
+        message: { case: "textDelta", value: create(TextDeltaUpdateSchema, { text }) },
+      }),
+    },
+  })));
+}
+
+function turnEndedFrame(): Uint8Array {
+  return encodeConnectFrame(toBinary(AgentServerMessageSchema, create(AgentServerMessageSchema, {
+    message: {
+      case: "interactionUpdate",
+      value: create(InteractionUpdateSchema, {
+        message: { case: "turnEnded", value: {} },
+      }),
+    },
+  })));
+}
+
+function endStreamFrame(): Uint8Array {
+  return encodeConnectFrame(new TextEncoder().encode("{}"), { endStream: true });
+}
+
+function createTestTransport(port: number) {
+  return createHttp1SseCursorTransport({
+    provider: {
+      adapter: "cursor",
+      baseUrl: `http://127.0.0.1:${port}`,
+      apiKey: "test-token",
+      cursorTransport: "http1-sse",
+    },
+    translatorBudget: createTestTranslatorBudget(),
+    firstFrameTimeoutMs: 2_000,
+  });
+}
+
+async function boundPort(server: ReturnType<typeof createServer>): Promise<number> {
+  servers.push(server);
+  await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  if (!address || typeof address === "string") throw new Error("test server did not bind");
+  return address.port;
 }
 
 describe("Cursor HTTP/1.1 SSE transport", () => {
@@ -137,6 +185,101 @@ describe("Cursor HTTP/1.1 SSE transport", () => {
       await transport.close?.();
     }
     expect(failure?.message).toContain("RunSSE returned HTTP 415");
+  });
+
+  test("tolerates an abortive close after the terminal frames", async () => {
+    // api2.cursor.sh tears down every HTTP/1.1 RunSSE turn with a connection close that
+    // reaches the client as 'aborted'/ECONNRESET AFTER turnEnded and the Connect end-stream
+    // frame (simulated here by destroying the socket without the chunked terminating chunk).
+    // The completed turn must still surface `done`, never a transport failure.
+    const server = createServer(async (request, response) => {
+      await readBody(request);
+      if (request.url === "/agent.v1.AgentService/RunSSE") {
+        response.writeHead(200, { "content-type": "application/connect+proto" });
+        response.write(Buffer.from(textDeltaFrame("OK")));
+        response.write(Buffer.from(turnEndedFrame()));
+        // Defer the teardown so the client has consumed every frame before the reset
+        // arrives — the production sequence is frames → client processing → RST.
+        response.write(Buffer.from(endStreamFrame()), () => {
+          setTimeout(() => response.socket.destroy(), 50);
+        });
+        return;
+      }
+      if (request.url === "/aiserver.v1.BidiService/BidiAppend") {
+        response.writeHead(200, { "content-type": "application/proto" });
+        response.end();
+        return;
+      }
+      response.writeHead(404);
+      response.end();
+    });
+    const port = await boundPort(server);
+    const transport = createTestTransport(port);
+
+    const messages = [];
+    let failure: Error | undefined;
+    try {
+      for await (const message of transport.run({
+        modelId: "composer-2.5",
+        conversationId: "http1-abort-after-terminal",
+        system: [],
+        messages: [{ role: "user", content: "hello" }],
+      })) {
+        messages.push(message);
+      }
+    } catch (error) {
+      failure = error instanceof Error ? error : new Error(String(error));
+    } finally {
+      await transport.close?.();
+    }
+
+    expect(failure).toBeUndefined();
+    expect(messages).toContainEqual({ type: "text", text: "OK" });
+    expect(messages).toMatchObject([{ type: "text", text: "OK" }, { type: "done" }]);
+  });
+
+  test("still fails when the stream aborts mid-turn", async () => {
+    // An abortive close BEFORE turnEnded is a genuine truncation and must surface as a
+    // transport failure — the post-terminal tolerance must never swallow it.
+    const server = createServer(async (request, response) => {
+      await readBody(request);
+      if (request.url === "/agent.v1.AgentService/RunSSE") {
+        response.writeHead(200, { "content-type": "application/connect+proto" });
+        response.write(Buffer.from(textDeltaFrame("partial")), () => {
+          setTimeout(() => response.socket.destroy(), 50);
+        });
+        return;
+      }
+      if (request.url === "/aiserver.v1.BidiService/BidiAppend") {
+        response.writeHead(200, { "content-type": "application/proto" });
+        response.end();
+        return;
+      }
+      response.writeHead(404);
+      response.end();
+    });
+    const port = await boundPort(server);
+    const transport = createTestTransport(port);
+
+    const messages = [];
+    let failure: Error | undefined;
+    try {
+      for await (const message of transport.run({
+        modelId: "composer-2.5",
+        conversationId: "http1-abort-mid-turn",
+        system: [],
+        messages: [{ role: "user", content: "hello" }],
+      })) {
+        messages.push(message);
+      }
+    } catch (error) {
+      failure = error instanceof Error ? error : new Error(String(error));
+    } finally {
+      await transport.close?.();
+    }
+
+    expect(messages).toContainEqual({ type: "text", text: "partial" });
+    expect(failure).toBeDefined();
   });
 
   test("reports an incomplete Connect frame from the HTTP/1.1 response", async () => {

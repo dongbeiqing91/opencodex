@@ -1394,6 +1394,12 @@ export interface OcxProviderConfig {
    * (current behavior unchanged). Only meaningful for https: base URLs.
    */
   upstreamHttpVersion?: UpstreamHttpVersion;
+  /**
+   * Cursor adapter only: select the wire transport to api2.cursor.sh. "http2" (default) is the
+   * native HTTP/2 Connect stream; "http1-sse" uses the HTTP/1.1 RunSSE + BidiAppend
+   * compatibility path for networks where HTTP/2 is blocked or broken by middleboxes.
+   */
+  cursorTransport?: "http2" | "http1-sse";
   /** Keep provider settings on disk but exclude it from routing and model/catalog listings. */
   disabled?: boolean;
   /**

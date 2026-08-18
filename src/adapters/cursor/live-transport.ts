@@ -418,6 +418,13 @@ class LiveCursorTransport implements CursorTransport {
   private firstFrameTimer?: ReturnType<typeof setTimeout>;
   private committed = false;
   private expectedClose = false;
+  /**
+   * Await quiescence of the per-turn frame-processing chain. open() installs the real drain once
+   * `frameWork` exists; the default no-op covers failures before the stream opens. Used by the
+   * failure path to let already-received terminal frames (turnEnded, Connect end-stream) finish
+   * processing before the failure is classified.
+   */
+  private drainFrameWork: () => Promise<void> = () => Promise.resolve();
   private pendingFinalize?: ReturnType<typeof setTimeout>;
   private readonly clientToolFinalizeGraceMs: number;
   private activeClientToolFinalizeGraceMs: number;
@@ -610,6 +617,29 @@ class LiveCursorTransport implements CursorTransport {
       throw error;
     }
 
+    // Failure classification shared by both exits below. The HTTP/1.1 wire ends every turn
+    // with a connection teardown that can surface as ECONNRESET/'aborted' AFTER the terminal
+    // frames were received (h2 never exposes this: its streams end with END_STREAM while the
+    // session persists). Drain the frame chain first so a turnEnded that raced the teardown is
+    // processed (pushing `done`) — a failure that lands after the turn's terminal state is
+    // connection-teardown noise, not a turn failure.
+    const classifyFailure = async (err: Error): Promise<Error | undefined> => {
+      // A CANCEL is benign only on the client-tool suspend path (expectedClose); an
+      // unexpected server-side NGHTTP2_CANCEL must surface as a real transport error.
+      if (this.expectedClose && isCursorBenignCancelError(err)) return undefined;
+      await this.drainFrameWork();
+      if (state.terminated) {
+        debugProviderDiagnostic("cursor", "post-terminal-close", {
+          code: (err as { code?: unknown }).code ?? undefined,
+          message: redactCursorForLog(err.message),
+          framesReceived: this.framesReceived,
+          elapsedMs: Date.now() - this.turnStartedAt,
+        });
+        return undefined;
+      }
+      return err;
+    };
+
     while (!done || queue.length > 0) {
       while (queue.length > 0) {
         const queued = queue.shift();
@@ -619,10 +649,17 @@ class LiveCursorTransport implements CursorTransport {
         }
       }
       if (failure) {
-        // A CANCEL is benign only on the client-tool suspend path (expectedClose); an
-        // unexpected server-side NGHTTP2_CANCEL must surface as a real transport error.
-        if (this.expectedClose && isCursorBenignCancelError(failure)) return;
-        throw attachPartialUsage(summarizeFailure(failure), state);
+        const fatal = await classifyFailure(failure);
+        // The drain may have processed a trailing turnEnded → done; yield it before leaving.
+        while (queue.length > 0) {
+          const queued = queue.shift();
+          if (queued) {
+            this.releaseTransportBytes(queued.bytes);
+            yield queued.message;
+          }
+        }
+        if (!fatal) return;
+        throw attachPartialUsage(summarizeFailure(fatal), state);
       }
       if (done) break;
       await new Promise<void>(resolve => {
@@ -630,8 +667,16 @@ class LiveCursorTransport implements CursorTransport {
       });
     }
     if (failure) {
-      if (this.expectedClose && isCursorBenignCancelError(failure)) return;
-      throw attachPartialUsage(summarizeFailure(failure), state);
+      const fatal = await classifyFailure(failure);
+      while (queue.length > 0) {
+        const queued = queue.shift();
+        if (queued) {
+          this.releaseTransportBytes(queued.bytes);
+          yield queued.message;
+        }
+      }
+      if (!fatal) return;
+      throw attachPartialUsage(summarizeFailure(fatal), state);
     }
   }
 
@@ -1025,6 +1070,16 @@ class LiveCursorTransport implements CursorTransport {
       backlogEnd = end + chunk.byteLength;
     };
     let frameWork: Promise<void> = Promise.resolve();
+    // Quiescence drain for the frame chain: the chain can extend itself while draining
+    // (a frame's work can surface more frames), so loop until no new work appears.
+    const drainFrameWork = async (): Promise<void> => {
+      let previous: Promise<void>;
+      do {
+        previous = frameWork;
+        await previous;
+      } while (previous !== frameWork);
+    };
+    this.drainFrameWork = drainFrameWork;
     // Idempotent terminal owner for the backlog lease: every settle/close path
     // must leave the raw charge at zero instead of relying on budget disposal.
     let backlogLeaseReleased = false;
@@ -1150,18 +1205,11 @@ class LiveCursorTransport implements CursorTransport {
         expectedClose: this.expectedClose,
         elapsedMs: Date.now() - this.turnStartedAt,
       });
-      // Settle only after queued frame work drains to quiescence (the chain can
-      // extend itself while draining), then classify the terminal state:
-      // a trailing incomplete frame is a typed failure, and a zero-frame,
+      // Settle only after queued frame work drains to quiescence, then classify the
+      // terminal state: a trailing incomplete frame is a typed failure, and a zero-frame,
       // zero-byte end without an expected close stays the existing unexpected
       // EOF — both beat the old silent success.
-      void (async () => {
-        let previous: Promise<void>;
-        do {
-          previous = frameWork;
-          await previous;
-        } while (previous !== frameWork);
-      })().then(() => {
+      void drainFrameWork().then(() => {
         if (settler.settled()) return;
         const leftover = backlogEnd - backlogStart;
         if (leftover > 0 && !this.expectedClose) {
